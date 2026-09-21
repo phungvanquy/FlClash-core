@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"github.com/metacubex/mihomo/adapter"
 	"time"
 
 	"github.com/metacubex/mihomo/common/structure"
@@ -44,7 +45,7 @@ type proxyProviderSchema struct {
 	Header      map[string][]string `provider:"header,omitempty"`
 }
 
-func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P.ProxyProvider, error) {
+func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel, options ...adapter.ProxyOption) (P.ProxyProvider, error) {
 	decoder := structure.NewDecoder(structure.Option{TagName: "provider", WeaklyTypedInput: true})
 
 	schema := &proxyProviderSchema{
@@ -69,8 +70,14 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 		hcInterval = uint(schema.HealthCheck.Interval)
 	}
 	hc := NewHealthCheck([]C.Proxy{}, schema.HealthCheck.URL, uint(schema.HealthCheck.TestTimeout), hcInterval, schema.HealthCheck.Lazy, expectedStatus)
+	accepted := false
+	defer func() {
+		if !accepted {
+			hc.close()
+		}
+	}()
 
-	parser, err := NewProxiesParser(name, tunnel, schema.Filter, schema.ExcludeFilter, schema.ExcludeType, schema.DialerProxy, schema.Override, schema.AgeSecretKey)
+	parser, err := NewProxiesParser(name, tunnel, schema.Filter, schema.ExcludeFilter, schema.ExcludeType, schema.DialerProxy, schema.Override, schema.AgeSecretKey, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -93,12 +100,16 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 		}
 		vehicle = resource.NewHTTPVehicle(schema.URL, path, schema.Proxy, schema.Header, resource.DefaultHttpTimeout, schema.SizeLimit)
 	case "inline":
-		return NewInlineProvider(name, schema.Payload, parser, hc)
+		provider, err := NewInlineProvider(name, schema.Payload, parser, hc)
+		accepted = err == nil
+		return provider, err
 	default:
 		return nil, fmt.Errorf("%w: %s", errVehicleType, schema.Type)
 	}
 
 	interval := time.Duration(uint(schema.Interval)) * time.Second
 
-	return NewProxySetProvider(name, interval, schema.Payload, parser, vehicle, hc)
+	provider, err := NewProxySetProvider(name, interval, schema.Payload, parser, vehicle, hc)
+	accepted = err == nil
+	return provider, err
 }

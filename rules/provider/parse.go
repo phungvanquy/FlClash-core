@@ -25,7 +25,7 @@ type ruleProviderSchema struct {
 	PathInBundle string              `provider:"path-in-bundle,omitempty"`
 }
 
-func ParseRuleProvider(name string, mapping map[string]any, parse common.ParseRuleFunc, makeBundleFile func(pathInBundle string) resource.BundleFile) (P.RuleProvider, error) {
+func ParseRuleProvider(name string, mapping map[string]any, parse common.ParseRuleFunc, makeBundleFile func(pathInBundle string) resource.BundleFile, detached ...bool) (P.RuleProvider, error) {
 	schema := &ruleProviderSchema{}
 	decoder := structure.NewDecoder(structure.Option{TagName: "provider", WeaklyTypedInput: true})
 	if err := decoder.Decode(mapping, schema); err != nil {
@@ -38,6 +38,11 @@ func ParseRuleProvider(name string, mapping map[string]any, parse common.ParseRu
 	format, err := P.ParseRuleFormat(schema.Format)
 	if err != nil {
 		return nil, err
+	}
+	if len(detached) > 0 && detached[0] {
+		if _, err := rulesParseStrictInline(schema.Payload, newStrategy(behavior, parse)); err != nil {
+			return nil, err
+		}
 	}
 
 	var vehicle P.Vehicle

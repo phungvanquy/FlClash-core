@@ -34,7 +34,6 @@ import (
 	"github.com/metacubex/mihomo/listener"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
-	R "github.com/metacubex/mihomo/rules"
 	RB "github.com/metacubex/mihomo/rules/bundle"
 	RC "github.com/metacubex/mihomo/rules/common"
 	RP "github.com/metacubex/mihomo/rules/provider"
@@ -193,6 +192,7 @@ type TLS struct {
 
 // Config is mihomo config manager
 type Config struct {
+	GeodataScope  *geodata.Scope
 	General       *General
 	Controller    *Controller
 	Experimental  *Experimental
@@ -617,6 +617,10 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 }
 
 func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+	return (&parseContext{}).parseRawConfig(rawCfg)
+}
+
+func (p *parseContext) parseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	config := &Config{}
 	log.Infoln("Start initial configuration in progress") //Segment finished in xxm
 	startTime := time.Now()
@@ -630,8 +634,10 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	// We need to temporarily apply some configuration in general and roll back after parsing the complete configuration.
 	// The loading and downloading of geodata in the parseRules and parseRuleProviders rely on these.
 	// This implementation is very disgusting, but there is currently no better solution
-	rollback := temporaryUpdateGeneral(config.General)
-	defer rollback()
+	if !p.detached {
+		rollback := temporaryUpdateGeneral(config.General)
+		defer rollback()
+	}
 
 	controller, err := parseController(rawCfg)
 	if err != nil {
@@ -669,7 +675,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	}
 	config.TLS = tlsCfg
 
-	proxies, providers, err := parseProxies(rawCfg)
+	proxies, providers, err := p.parseProxies(rawCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -684,19 +690,19 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 
 	log.Infoln("Geodata Loader mode: %s", geodata.LoaderName())
 	log.Infoln("Geosite Matcher implementation: %s", geodata.SiteMatcherName())
-	ruleProviders, err := parseRuleProviders(rawCfg)
+	ruleProviders, err := p.parseRuleProviders(rawCfg)
 	if err != nil {
 		return nil, err
 	}
 	config.RuleProviders = ruleProviders
 
-	subRules, err := parseSubRules(rawCfg, proxies, ruleProviders)
+	subRules, err := p.parseSubRules(rawCfg, proxies, ruleProviders)
 	if err != nil {
 		return nil, err
 	}
 	config.SubRules = subRules
 
-	rules, err := parseRules(rawCfg.Rule, proxies, ruleProviders, subRules, "rules")
+	rules, err := p.parseRules(rawCfg.Rule, proxies, ruleProviders, subRules, "rules")
 	if err != nil {
 		return nil, err
 	}
@@ -710,7 +716,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 
 	parseIPV6(rawCfg) // must before DNS and Tun
 
-	dnsCfg, err := parseDNS(rawCfg, ruleProviders)
+	dnsCfg, err := p.parseDNS(rawCfg, ruleProviders)
 	if err != nil {
 		return nil, err
 	}
@@ -738,7 +744,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		}
 	}
 
-	config.Sniffer, err = parseSniffer(rawCfg.Sniffer, ruleProviders)
+	config.Sniffer, err = p.parseSniffer(rawCfg.Sniffer, ruleProviders)
 	if err != nil {
 		return nil, err
 	}
@@ -872,8 +878,25 @@ func parseTLS(cfg *RawConfig) (*TLS, error) {
 }
 
 func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]P.ProxyProvider, err error) {
+	return (&parseContext{}).parseProxies(cfg)
+}
+
+func (p *parseContext) parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]P.ProxyProvider, err error) {
 	proxies = make(map[string]C.Proxy)
 	providersMap = make(map[string]P.ProxyProvider)
+	if p.detached {
+		owned := providersMap
+		defer func() {
+			for _, pd := range owned {
+				p.own(pd)
+				if pd.VehicleType() != P.Compatible {
+					for _, proxy := range pd.Proxies() {
+						p.own(proxy)
+					}
+				}
+			}
+		}()
+	}
 	proxiesConfig := cfg.Proxy
 	groupsConfig := cfg.ProxyGroup
 	providersConfig := cfg.ProxyProvider
@@ -894,10 +917,11 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 
 	// parse proxy
 	for idx, mapping := range proxiesConfig {
-		proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(T.Tunnel))
+		proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(T.Tunnel), adapter.WithDetached(p.detached), adapter.WithDeferredActivation(p.deferActivation))
 		if err != nil {
 			return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
 		}
+		p.own(proxy)
 
 		if _, exist := proxies[proxy.Name()]; exist {
 			return nil, nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
@@ -931,7 +955,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 			return nil, nil, fmt.Errorf("can not defined a provider called `%s`", provider.ReservedName)
 		}
 
-		pd, err := provider.ParseProxyProvider(name, mapping, T.Tunnel)
+		pd, err := provider.ParseProxyProvider(p.providerName("proxy", name), mapping, T.Tunnel, adapter.WithDetached(p.detached), adapter.WithDeferredActivation(p.deferActivation))
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse proxy provider %s error: %w", name, err)
 		}
@@ -989,7 +1013,11 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 		return nil, nil, err
 	}
 
-	SetProxyNameList(proxyList)
+	if p.detached {
+		p.proxyNames = proxyList
+	} else {
+		SetProxyNameList(proxyList)
+	}
 	return proxies, providersMap, nil
 }
 
@@ -1012,22 +1040,25 @@ func parseListeners(cfg *RawConfig) (listeners map[string]C.InboundListener, err
 	return
 }
 
-func parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider, err error) {
-	RP.SetTunnel(T.Tunnel)
+func (p *parseContext) parseRuleProviders(cfg *RawConfig) (ruleProviders map[string]P.RuleProvider, err error) {
+	if !p.detached {
+		RP.SetTunnel(T.Tunnel)
+	}
 	ruleProviders = map[string]P.RuleProvider{}
 	// parse rule provider
 	for name, mapping := range cfg.RuleProvider {
-		rp, err := RP.ParseRuleProvider(name, mapping, R.ParseRule, RB.MakeBundleFile)
+		rp, err := RP.ParseRuleProvider(p.providerName("rule", name), mapping, p.ruleParser.ParseRule, RB.MakeBundleFile, p.detached)
 		if err != nil {
 			return nil, err
 		}
 
 		ruleProviders[name] = rp
+		p.own(rp)
 	}
 	return
 }
 
-func parseSubRules(cfg *RawConfig, proxies map[string]C.Proxy, ruleProviders map[string]P.RuleProvider) (subRules map[string][]C.Rule, err error) {
+func (p *parseContext) parseSubRules(cfg *RawConfig, proxies map[string]C.Proxy, ruleProviders map[string]P.RuleProvider) (subRules map[string][]C.Rule, err error) {
 	subRules = map[string][]C.Rule{}
 	for name := range cfg.SubRules {
 		subRules[name] = make([]C.Rule, 0)
@@ -1037,7 +1068,7 @@ func parseSubRules(cfg *RawConfig, proxies map[string]C.Proxy, ruleProviders map
 			return nil, fmt.Errorf("sub-rule name is empty")
 		}
 		var rules []C.Rule
-		rules, err = parseRules(rawRules, proxies, ruleProviders, subRules, fmt.Sprintf("sub-rules[%s]", name))
+		rules, err = p.parseRules(rawRules, proxies, ruleProviders, subRules, fmt.Sprintf("sub-rules[%s]", name))
 		if err != nil {
 			return nil, err
 		}
@@ -1090,7 +1121,7 @@ func verifySubRuleCircularReferences(n string, subRules map[string][]C.Rule, arr
 	return nil
 }
 
-func parseRules(rulesConfig []string, proxies map[string]C.Proxy, ruleProviders map[string]P.RuleProvider, subRules map[string][]C.Rule, format string) ([]C.Rule, error) {
+func (p *parseContext) parseRules(rulesConfig []string, proxies map[string]C.Proxy, ruleProviders map[string]P.RuleProvider, subRules map[string][]C.Rule, format string) ([]C.Rule, error) {
 	var rules []C.Rule
 
 	// parse rules
@@ -1108,7 +1139,7 @@ func parseRules(rulesConfig []string, proxies map[string]C.Proxy, ruleProviders 
 			}
 		}
 
-		parsed, parseErr := R.ParseRule(tp, payload, target, params, subRules)
+		parsed, parseErr := p.ruleParser.ParseRule(tp, payload, target, params, subRules)
 		if parseErr != nil {
 			return nil, fmt.Errorf("%s[%d] [%s] error: %s", format, idx, line, parseErr.Error())
 		}
@@ -1324,7 +1355,7 @@ func parsePureDNSServer(server string) string {
 	}
 }
 
-func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], ruleProviders map[string]P.RuleProvider, respectRules bool, preferH3 bool) ([]dns.Policy, error) {
+func (parser *parseContext) parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], ruleProviders map[string]P.RuleProvider, respectRules bool, preferH3 bool) ([]dns.Policy, error) {
 	var policy []dns.Policy
 
 	for pair := nsPolicy.Oldest(); pair != nil; pair = pair.Next() {
@@ -1384,7 +1415,7 @@ func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], rulePro
 			policy[idx] = dns.Policy{Matcher: matcher, NameServers: nameservers}
 		} else if strings.HasPrefix(domain, "geosite:") {
 			country := domain[8:]
-			matcher, err := RC.NewGEOSITE(country, "dns.nameserver-policy")
+			matcher, err := RC.NewScopedGEOSITE(country, "dns.nameserver-policy", parser.ruleParser.Geodata)
 			if err != nil {
 				return nil, err
 			}
@@ -1399,7 +1430,7 @@ func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], rulePro
 	return policy, nil
 }
 
-func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS, error) {
+func (p *parseContext) parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS, error) {
 	cfg := rawCfg.DNS
 	if cfg.Enable && len(cfg.NameServer) == 0 {
 		return nil, fmt.Errorf("if DNS configuration is turned on, NameServer cannot be empty")
@@ -1431,7 +1462,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		return nil, err
 	}
 
-	if dnsCfg.NameServerPolicy, err = parseNameServerPolicy(cfg.NameServerPolicy, ruleProviders, cfg.RespectRules, cfg.PreferH3); err != nil {
+	if dnsCfg.NameServerPolicy, err = p.parseNameServerPolicy(cfg.NameServerPolicy, ruleProviders, cfg.RespectRules, cfg.PreferH3); err != nil {
 		return nil, err
 	}
 
@@ -1439,7 +1470,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		return nil, err
 	}
 
-	if dnsCfg.ProxyServerPolicy, err = parseNameServerPolicy(cfg.ProxyServerNameserverPolicy, ruleProviders, false, cfg.PreferH3); err != nil {
+	if dnsCfg.ProxyServerPolicy, err = p.parseNameServerPolicy(cfg.ProxyServerNameserverPolicy, ruleProviders, false, cfg.PreferH3); err != nil {
 		return nil, err
 	}
 	if len(dnsCfg.ProxyServerPolicy) != 0 && len(dnsCfg.ProxyServerNameserver) == 0 {
@@ -1508,13 +1539,13 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		skipper := &fakeip.Skipper{Mode: cfg.FakeIPFilterMode}
 
 		if cfg.FakeIPFilterMode == C.FilterRule {
-			rules, err := parseFakeIPRules(cfg.FakeIPFilter, ruleProviders)
+			rules, err := p.parseFakeIPRules(cfg.FakeIPFilter, ruleProviders)
 			if err != nil {
 				return nil, err
 			}
 			skipper.Rules = rules
 		} else {
-			host, err := parseDomain(cfg.FakeIPFilter, fakeIPTrie, "dns.fake-ip-filter", ruleProviders)
+			host, err := p.parseDomain(cfg.FakeIPFilter, fakeIPTrie, "dns.fake-ip-filter", ruleProviders)
 			if err != nil {
 				return nil, err
 			}
@@ -1528,7 +1559,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 			pool, err := fakeip.New(fakeip.Options{
 				IPNet:       dnsCfg.FakeIPRange,
 				Size:        1000,
-				Persistence: rawCfg.Profile.StoreFakeIP,
+				Persistence: rawCfg.Profile.StoreFakeIP && !p.detached,
 			})
 			if err != nil {
 				return nil, err
@@ -1540,7 +1571,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 			pool6, err := fakeip.New(fakeip.Options{
 				IPNet:       dnsCfg.FakeIPRange6,
 				Size:        1000,
-				Persistence: rawCfg.Profile.StoreFakeIP,
+				Persistence: rawCfg.Profile.StoreFakeIP && !p.detached,
 			})
 			if err != nil {
 				return nil, err
@@ -1555,7 +1586,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 
 	if len(cfg.Fallback) != 0 {
 		if cfg.FallbackFilter.GeoIP {
-			matcher, err := RC.NewGEOIP(cfg.FallbackFilter.GeoIPCode, "dns.fallback-filter.geoip", false, true)
+			matcher, err := RC.NewScopedGEOIP(cfg.FallbackFilter.GeoIPCode, "dns.fallback-filter.geoip", false, true, p.ruleParser.Geodata)
 			if err != nil {
 				return nil, fmt.Errorf("load GeoIP dns fallback filter error, %w", err)
 			}
@@ -1590,7 +1621,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		if len(cfg.FallbackFilter.GeoSite) > 0 {
 			log.Warnln("replace fallback-filter.geosite with nameserver-policy, it will be removed in the future")
 			for idx, geoSite := range cfg.FallbackFilter.GeoSite {
-				matcher, err := RC.NewGEOSITE(geoSite, "dns.fallback-filter.geosite")
+				matcher, err := RC.NewScopedGEOSITE(geoSite, "dns.fallback-filter.geosite", p.ruleParser.Geodata)
 				if err != nil {
 					return nil, fmt.Errorf("DNS FallbackGeosite[%d] format error: %w", idx, err)
 				}
@@ -1603,7 +1634,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 	return dnsCfg, nil
 }
 
-func parseFakeIPRules(rawRules []string, ruleProviders map[string]P.RuleProvider) ([]C.Rule, error) {
+func (p *parseContext) parseFakeIPRules(rawRules []string, ruleProviders map[string]P.RuleProvider) ([]C.Rule, error) {
 	var rules []C.Rule
 
 	for idx, line := range rawRules {
@@ -1628,7 +1659,7 @@ func parseFakeIPRules(rawRules []string, ruleProviders map[string]P.RuleProvider
 			}
 		}
 
-		parsed, err := R.ParseRule(tp, payload, action, params, nil)
+		parsed, err := p.ruleParser.ParseRule(tp, payload, action, params, nil)
 		if err != nil {
 			return nil, fmt.Errorf("dns.fake-ip-filter[%d] [%s] error: %w", idx, line, err)
 		}
@@ -1752,7 +1783,7 @@ func parseTuicServer(rawTuic RawTuicServer, general *General) error {
 	return nil
 }
 
-func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider) (*sniffer.Config, error) {
+func (p *parseContext) parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider) (*sniffer.Config, error) {
 	snifferConfig := &sniffer.Config{
 		Enable:          snifferRaw.Enable,
 		ForceDnsMapping: snifferRaw.ForceDnsMapping,
@@ -1815,25 +1846,25 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
 
 	snifferConfig.Sniffers = loadSniffer
 
-	forceDomain, err := parseDomain(snifferRaw.ForceDomain, nil, "sniffer.force-domain", ruleProviders)
+	forceDomain, err := p.parseDomain(snifferRaw.ForceDomain, nil, "sniffer.force-domain", ruleProviders)
 	if err != nil {
 		return nil, fmt.Errorf("error in force-domain, error:%w", err)
 	}
 	snifferConfig.ForceDomain = forceDomain
 
-	skipSrcAddress, err := parseIPCIDR(snifferRaw.SkipSrcAddress, nil, "sniffer.skip-src-address", ruleProviders)
+	skipSrcAddress, err := p.parseIPCIDR(snifferRaw.SkipSrcAddress, nil, "sniffer.skip-src-address", ruleProviders)
 	if err != nil {
 		return nil, fmt.Errorf("error in skip-src-address, error:%w", err)
 	}
 	snifferConfig.SkipSrcAddress = skipSrcAddress
 
-	skipDstAddress, err := parseIPCIDR(snifferRaw.SkipDstAddress, nil, "sniffer.skip-dst-address", ruleProviders)
+	skipDstAddress, err := p.parseIPCIDR(snifferRaw.SkipDstAddress, nil, "sniffer.skip-dst-address", ruleProviders)
 	if err != nil {
 		return nil, fmt.Errorf("error in skip-dst-address, error:%w", err)
 	}
 	snifferConfig.SkipDstAddress = skipDstAddress
 
-	skipDomain, err := parseDomain(snifferRaw.SkipDomain, nil, "sniffer.skip-domain", ruleProviders)
+	skipDomain, err := p.parseDomain(snifferRaw.SkipDomain, nil, "sniffer.skip-domain", ruleProviders)
 	if err != nil {
 		return nil, fmt.Errorf("error in skip-domain, error:%w", err)
 	}
@@ -1842,7 +1873,7 @@ func parseSniffer(snifferRaw RawSniffer, ruleProviders map[string]P.RuleProvider
 	return snifferConfig, nil
 }
 
-func parseIPCIDR(addresses []string, cidrSet *cidr.IpCidrSet, adapterName string, ruleProviders map[string]P.RuleProvider) (matchers []C.IpMatcher, err error) {
+func (p *parseContext) parseIPCIDR(addresses []string, cidrSet *cidr.IpCidrSet, adapterName string, ruleProviders map[string]P.RuleProvider) (matchers []C.IpMatcher, err error) {
 	var matcher C.IpMatcher
 	for _, ipcidr := range addresses {
 		ipcidrLower := strings.ToLower(ipcidr)
@@ -1851,7 +1882,7 @@ func parseIPCIDR(addresses []string, cidrSet *cidr.IpCidrSet, adapterName string
 			subkeys = subkeys[1:]
 			subkeys = strings.Split(subkeys[0], ",")
 			for _, country := range subkeys {
-				matcher, err = RC.NewGEOIP(country, adapterName, false, false)
+				matcher, err = RC.NewScopedGEOIP(country, adapterName, false, false, p.ruleParser.Geodata)
 				if err != nil {
 					return nil, err
 				}
@@ -1889,7 +1920,7 @@ func parseIPCIDR(addresses []string, cidrSet *cidr.IpCidrSet, adapterName string
 	return
 }
 
-func parseDomain(domains []string, domainTrie *trie.DomainTrie[struct{}], adapterName string, ruleProviders map[string]P.RuleProvider) (matchers []C.DomainMatcher, err error) {
+func (p *parseContext) parseDomain(domains []string, domainTrie *trie.DomainTrie[struct{}], adapterName string, ruleProviders map[string]P.RuleProvider) (matchers []C.DomainMatcher, err error) {
 	var matcher C.DomainMatcher
 	for _, domain := range domains {
 		domainLower := strings.ToLower(domain)
@@ -1898,7 +1929,7 @@ func parseDomain(domains []string, domainTrie *trie.DomainTrie[struct{}], adapte
 			subkeys = subkeys[1:]
 			subkeys = strings.Split(subkeys[0], ",")
 			for _, country := range subkeys {
-				matcher, err = RC.NewGEOSITE(country, adapterName)
+				matcher, err = RC.NewScopedGEOSITE(country, adapterName, p.ruleParser.Geodata)
 				if err != nil {
 					return nil, err
 				}

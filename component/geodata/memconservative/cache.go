@@ -3,6 +3,7 @@ package memconservative
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/metacubex/mihomo/component/geodata/router"
@@ -32,7 +33,10 @@ func (g GeoIPCache) Set(key string, value *router.GeoIP) {
 }
 
 func (g GeoIPCache) Unmarshal(filename, code string) (*router.GeoIP, error) {
-	asset := C.Path.GetAssetLocation(filename)
+	asset := filename
+	if !filepath.IsAbs(asset) {
+		asset = C.Path.GetAssetLocation(filename)
+	}
 	idx := strings.ToLower(asset + ":" + code)
 	if g.Has(idx) {
 		return g.Get(idx), nil
@@ -97,7 +101,10 @@ func (g GeoSiteCache) Set(key string, value *router.GeoSite) {
 }
 
 func (g GeoSiteCache) Unmarshal(filename, code string) (*router.GeoSite, error) {
-	asset := C.Path.GetAssetLocation(filename)
+	asset := filename
+	if !filepath.IsAbs(asset) {
+		asset = C.Path.GetAssetLocation(filename)
+	}
 	idx := strings.ToLower(asset + ":" + code)
 	if g.Has(idx) {
 		return g.Get(idx), nil

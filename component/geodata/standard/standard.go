@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/metacubex/mihomo/component/geodata"
@@ -26,6 +27,9 @@ func ReadFile(path string) ([]byte, error) {
 }
 
 func ReadAsset(file string) ([]byte, error) {
+	if filepath.IsAbs(file) {
+		return ReadFile(file)
+	}
 	return ReadFile(C.Path.GetAssetLocation(file))
 }
 

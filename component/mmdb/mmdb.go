@@ -25,6 +25,19 @@ var (
 	asnOnce   sync.Once
 )
 
+func NewIPReader(reader *maxminddb.Reader) IPReader {
+	result := IPReader{Reader: reader}
+	switch reader.Metadata.DatabaseType {
+	case "sing-geoip":
+		result.databaseType = typeSing
+	case "Meta-geoip0":
+		result.databaseType = typeMetaV0
+	default:
+		result.databaseType = typeMaxmind
+	}
+	return result
+}
+
 func LoadFromBytes(buffer []byte) {
 	ipOnce.Do(func() {
 		mmdb, err := maxminddb.FromBytes(buffer)
@@ -93,4 +106,16 @@ func ReloadIP() {
 
 func ReloadASN() {
 	mihomoOnce.Reset(&asnOnce)
+}
+
+func CloseLoadedIP() {
+	if ipReader.Reader != nil {
+		_ = ipReader.Reader.Close()
+	}
+}
+
+func CloseLoadedASN() {
+	if asnReader.Reader != nil {
+		_ = asnReader.Reader.Close()
+	}
 }

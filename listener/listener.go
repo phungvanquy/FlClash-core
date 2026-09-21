@@ -1,6 +1,7 @@
 package listener
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -74,6 +75,50 @@ type Ports struct {
 	VmessConfig       string `json:"vmess-config"`
 }
 
+type RuntimeState struct {
+	Active    bool
+	Tun       bool
+	MixedPort int
+}
+
+func GetRuntimeState() RuntimeState {
+	state := RuntimeState{}
+	read := func(lock *sync.Mutex, present func() bool) bool {
+		lock.Lock()
+		defer lock.Unlock()
+		return present()
+	}
+	state.Tun = read(&tunMux, func() bool { return tunLister != nil })
+	state.Active = state.Tun
+	for _, entry := range []struct {
+		lock    *sync.Mutex
+		present func() bool
+	}{
+		{&mixedMux, func() bool {
+			if mixedListener == nil {
+				return false
+			}
+			_, port, _ := net.SplitHostPort(mixedListener.Address())
+			state.MixedPort, _ = strconv.Atoi(port)
+			return true
+		}},
+		{&httpMux, func() bool { return httpListener != nil }},
+		{&socksMux, func() bool { return socksListener != nil || socksUDPListener != nil }},
+		{&redirMux, func() bool { return redirListener != nil || redirUDPListener != nil }},
+		{&tproxyMux, func() bool { return tproxyListener != nil || tproxyUDPListener != nil }},
+		{&ssMux, func() bool { return shadowSocksListener != nil }},
+		{&vmessMux, func() bool { return vmessListener != nil }},
+		{&tuicMux, func() bool { return tuicListener != nil }},
+		{&inboundMux, func() bool { return len(inboundListeners) != 0 }},
+		{&tunnelMux, func() bool { return len(tunnelTCPListeners) != 0 || len(tunnelUDPListeners) != 0 }},
+	} {
+		if read(entry.lock, entry.present) {
+			state.Active = true
+		}
+	}
+	return state
+}
+
 func GetTunConf() LC.Tun {
 	if tunLister == nil {
 		return LastTunConf
@@ -104,11 +149,10 @@ func SetBindAddress(host string) {
 	bindAddress = host
 }
 
-func ReCreateHTTP(port int, tunnel C.Tunnel) {
+func ReCreateHTTP(port int, tunnel C.Tunnel) (err error) {
 	httpMux.Lock()
 	defer httpMux.Unlock()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start HTTP server error: %s", err.Error())
@@ -136,13 +180,13 @@ func ReCreateHTTP(port int, tunnel C.Tunnel) {
 	}
 
 	log.Infoln("HTTP proxy listening at: %s", httpListener.Address())
+	return
 }
 
-func ReCreateSocks(port int, tunnel C.Tunnel) {
+func ReCreateSocks(port int, tunnel C.Tunnel) (err error) {
 	socksMux.Lock()
 	defer socksMux.Unlock()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start SOCKS server error: %s", err.Error())
@@ -195,13 +239,13 @@ func ReCreateSocks(port int, tunnel C.Tunnel) {
 	socksUDPListener = udpListener
 
 	log.Infoln("SOCKS proxy listening at: %s", socksListener.Address())
+	return
 }
 
-func ReCreateRedir(port int, tunnel C.Tunnel) {
+func ReCreateRedir(port int, tunnel C.Tunnel) (err error) {
 	redirMux.Lock()
 	defer redirMux.Unlock()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start Redir server error: %s", err.Error())
@@ -241,13 +285,13 @@ func ReCreateRedir(port int, tunnel C.Tunnel) {
 	}
 
 	log.Infoln("Redirect proxy listening at: %s", redirListener.Address())
+	return
 }
 
-func ReCreateShadowSocks(shadowSocksConfig string, tunnel C.Tunnel) {
+func ReCreateShadowSocks(shadowSocksConfig string, tunnel C.Tunnel) (err error) {
 	ssMux.Lock()
 	defer ssMux.Unlock()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start ShadowSocks server error: %s", err.Error())
@@ -297,11 +341,10 @@ func ReCreateShadowSocks(shadowSocksConfig string, tunnel C.Tunnel) {
 	return
 }
 
-func ReCreateVmess(vmessConfig string, tunnel C.Tunnel) {
+func ReCreateVmess(vmessConfig string, tunnel C.Tunnel) (err error) {
 	vmessMux.Lock()
 	defer vmessMux.Unlock()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start Vmess server error: %s", err.Error())
@@ -349,7 +392,7 @@ func ReCreateVmess(vmessConfig string, tunnel C.Tunnel) {
 	return
 }
 
-func ReCreateTuic(config LC.TuicServer, tunnel C.Tunnel) {
+func ReCreateTuic(config LC.TuicServer, tunnel C.Tunnel) (err error) {
 	tuicMux.Lock()
 	defer func() {
 		LastTuicConf = config
@@ -357,7 +400,6 @@ func ReCreateTuic(config LC.TuicServer, tunnel C.Tunnel) {
 	}()
 	shouldIgnore := false
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start Tuic server error: %s", err.Error())
@@ -394,11 +436,10 @@ func ReCreateTuic(config LC.TuicServer, tunnel C.Tunnel) {
 	return
 }
 
-func ReCreateTProxy(port int, tunnel C.Tunnel) {
+func ReCreateTProxy(port int, tunnel C.Tunnel) (err error) {
 	tproxyMux.Lock()
 	defer tproxyMux.Unlock()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start TProxy server error: %s", err.Error())
@@ -438,13 +479,13 @@ func ReCreateTProxy(port int, tunnel C.Tunnel) {
 	}
 
 	log.Infoln("TProxy server listening at: %s", tproxyListener.Address())
+	return
 }
 
-func ReCreateMixed(port int, tunnel C.Tunnel) {
+func ReCreateMixed(port int, tunnel C.Tunnel) (err error) {
 	mixedMux.Lock()
 	defer mixedMux.Unlock()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start Mixed(http+socks) server error: %s", err.Error())
@@ -489,13 +530,15 @@ func ReCreateMixed(port int, tunnel C.Tunnel) {
 	mixedUDPLister, err = socks.NewUDP(addr, tunnel)
 	if err != nil {
 		mixedListener.Close()
+		mixedListener = nil
 		return
 	}
 
 	log.Infoln("Mixed(http+socks) proxy listening at: %s", mixedListener.Address())
+	return
 }
 
-func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
+func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) (err error) {
 	tunConf.Sort()
 
 	tunMux.Lock()
@@ -504,7 +547,6 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 		tunMux.Unlock()
 	}()
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("Start TUN listening error: %s", err.Error())
@@ -530,11 +572,13 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 	tunLister = lister
 
 	log.Infoln("[TUN] Tun adapter listening at: %s", tunLister.Address())
+	return
 }
 
-func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) {
+func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) error {
 	tunnelMux.Lock()
 	defer tunnelMux.Unlock()
+	var failures []error
 
 	type addrProxy struct {
 		network string
@@ -606,6 +650,7 @@ func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) {
 			l, err := LT.New(elm.addr, elm.target, elm.proxy, lc, tunnel)
 			if err != nil {
 				log.Errorln("Start tunnel %s error: %s", elm.target, err.Error())
+				failures = append(failures, err)
 				continue
 			}
 			tunnelTCPListeners[key] = l
@@ -614,17 +659,20 @@ func PatchTunnel(tunnels []LC.Tunnel, tunnel C.Tunnel) {
 			l, err := LT.NewUDP(elm.addr, elm.target, elm.proxy, lc, tunnel)
 			if err != nil {
 				log.Errorln("Start tunnel %s error: %s", elm.target, err.Error())
+				failures = append(failures, err)
 				continue
 			}
 			tunnelUDPListeners[key] = l
 			log.Infoln("Tunnel(udp/%s) proxy %s listening at: %s", elm.target, elm.proxy, tunnelUDPListeners[key].Address())
 		}
 	}
+	return errors.Join(failures...)
 }
 
-func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C.Tunnel, dropOld bool) {
+func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C.Tunnel, dropOld bool) error {
 	inboundMux.Lock()
 	defer inboundMux.Unlock()
+	var failures []error
 
 	for name, newListener := range newListenerMap {
 		if oldListener, ok := inboundListeners[name]; ok {
@@ -636,6 +684,7 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
 		}
 		if err := newListener.Listen(tunnel); err != nil {
 			log.Errorln("Listener %s listen err: %s", name, err.Error())
+			failures = append(failures, fmt.Errorf("listener %s: %w", name, err))
 			continue
 		}
 		inboundListeners[name] = newListener
@@ -649,6 +698,7 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
 			}
 		}
 	}
+	return errors.Join(failures...)
 }
 
 // GetPorts return the ports of proxy servers

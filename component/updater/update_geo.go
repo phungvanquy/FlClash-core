@@ -45,6 +45,7 @@ func SetGeoUpdateInterval(newGeoUpdateInterval int) {
 }
 
 func UpdateMMDB() (err error) {
+	scope := geodata.ActiveScope()
 	sendGeoUpdateStatus("MMDB", true, false, nil)
 	var skipped bool
 	defer func() { sendGeoUpdateStatus("MMDB", false, skipped, err) }()
@@ -74,14 +75,18 @@ func UpdateMMDB() (err error) {
 	_ = instance.Close()
 
 	defer mmdb.ReloadIP()
-	mmdb.IPInstance().Reader.Close() //  mmdb is loaded with mmap, so it needs to be closed before overwriting the file
+	mmdb.CloseLoadedIP()
 	if err = vehicle.Write(data); err != nil {
 		return fmt.Errorf("can't save MMDB database file: %w", err)
+	}
+	if scope != nil {
+		return scope.Refresh("Country.mmdb", vehicle.Path())
 	}
 	return nil
 }
 
 func UpdateASN() (err error) {
+	scope := geodata.ActiveScope()
 	sendGeoUpdateStatus("ASN", true, false, nil)
 	var skipped bool
 	defer func() { sendGeoUpdateStatus("ASN", false, skipped, err) }()
@@ -111,14 +116,18 @@ func UpdateASN() (err error) {
 	_ = instance.Close()
 
 	defer mmdb.ReloadASN()
-	mmdb.ASNInstance().Reader.Close() //  mmdb is loaded with mmap, so it needs to be closed before overwriting the file
+	mmdb.CloseLoadedASN()
 	if err = vehicle.Write(data); err != nil {
 		return fmt.Errorf("can't save ASN database file: %w", err)
+	}
+	if scope != nil {
+		return scope.Refresh("ASN.mmdb", vehicle.Path())
 	}
 	return nil
 }
 
 func UpdateGeoIp() (err error) {
+	scope := geodata.ActiveScope()
 	sendGeoUpdateStatus("GEOIP", true, false, nil)
 	var skipped bool
 	defer func() { sendGeoUpdateStatus("GEOIP", false, skipped, err) }()
@@ -151,10 +160,14 @@ func UpdateGeoIp() (err error) {
 	if err = vehicle.Write(data); err != nil {
 		return fmt.Errorf("can't save GeoIP database file: %w", err)
 	}
+	if scope != nil {
+		return scope.Refresh("GeoIP.dat", vehicle.Path())
+	}
 	return nil
 }
 
 func UpdateGeoSite() (err error) {
+	scope := geodata.ActiveScope()
 	sendGeoUpdateStatus("GEOSITE", true, false, nil)
 	var skipped bool
 	defer func() { sendGeoUpdateStatus("GEOSITE", false, skipped, err) }()
@@ -186,6 +199,9 @@ func UpdateGeoSite() (err error) {
 	defer geodata.ClearGeoSiteCache()
 	if err = vehicle.Write(data); err != nil {
 		return fmt.Errorf("can't save GeoSite database file: %w", err)
+	}
+	if scope != nil {
+		return scope.Refresh("GeoSite.dat", vehicle.Path())
 	}
 	return nil
 }

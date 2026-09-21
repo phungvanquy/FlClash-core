@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
@@ -49,6 +50,8 @@ type baseProvider struct {
 	proxies     []C.Proxy
 	healthCheck *HealthCheck
 	version     uint32
+	started     atomic.Bool
+	closed      atomic.Bool
 }
 
 func (bp *baseProvider) Name() string {
@@ -62,8 +65,18 @@ func (bp *baseProvider) Version() uint32 {
 }
 
 func (bp *baseProvider) Initial() error {
-	if bp.healthCheck.auto() {
+	if bp.closed.Load() {
+		return errors.New("provider is closed")
+	}
+	if bp.started.CompareAndSwap(false, true) && bp.healthCheck.auto() {
 		go bp.healthCheck.process()
+	}
+	return nil
+}
+
+func (bp *baseProvider) Prepare() error {
+	if bp.closed.Load() {
+		return errors.New("provider is closed")
 	}
 	return nil
 }
@@ -106,12 +119,13 @@ func (bp *baseProvider) setProxies(proxies []C.Proxy) {
 	bp.proxies = proxies
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
-	if bp.healthCheck.auto() {
+	if bp.started.Load() && bp.healthCheck.auto() {
 		go bp.healthCheck.check()
 	}
 }
 
 func (bp *baseProvider) Close() error {
+	bp.closed.Store(true)
 	bp.healthCheck.close()
 	return nil
 }
@@ -150,11 +164,14 @@ func (pp *proxySetProvider) Update() error {
 }
 
 func (pp *proxySetProvider) Initial() error {
-	if err := pp.baseProvider.Initial(); err != nil {
-		return err
+	if pp.closed.Load() {
+		return errors.New("provider is closed")
 	}
 	_, err := pp.Fetcher.Initial()
 	if err != nil {
+		return err
+	}
+	if err := pp.baseProvider.Initial(); err != nil {
 		return err
 	}
 	if subscriptionInfo := cachefile.Cache().GetSubscriptionInfo(pp.Name()); subscriptionInfo != "" {
@@ -162,6 +179,11 @@ func (pp *proxySetProvider) Initial() error {
 	}
 	pp.closeAllConnections()
 	return nil
+}
+
+func (pp *proxySetProvider) Prepare() error {
+	_, err := pp.Fetcher.Prepare()
+	return err
 }
 
 func (pp *proxySetProvider) closeAllConnections() {
@@ -340,7 +362,7 @@ func (cp *CompatibleProvider) Close() error {
 	return cp.compatibleProvider.Close()
 }
 
-func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string) (resource.Parser[[]C.Proxy], error) {
+func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string, options ...adapter.ProxyOption) (resource.Parser[[]C.Proxy], error) {
 	var excludeTypeArray []string
 	if excludeType != "" {
 		excludeTypeArray = strings.Split(excludeType, "|")
@@ -392,8 +414,26 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 		if schema.Proxies == nil {
 			return nil, errors.New("file must have a `proxies` field")
 		}
+		if adapter.IsDetached(options...) {
+			names := make(map[string]bool)
+			for _, mapping := range schema.Proxies {
+				name, _ := mapping["name"].(string)
+				if name == "" || names[name] {
+					return nil, fmt.Errorf("missing or duplicate proxy name in provider %s", pdName)
+				}
+				names[name] = true
+			}
+		}
 
 		proxies := []C.Proxy{}
+		accepted := false
+		defer func() {
+			if !accepted {
+				for _, proxy := range proxies {
+					_ = proxy.Close()
+				}
+			}
+		}()
 		proxiesSet := map[string]struct{}{}
 		for _, filterReg := range filterRegs {
 		LOOP1:
@@ -446,7 +486,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 					return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
 				}
 
-				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
+				proxy, err := adapter.ParseProxy(mapping, append([]adapter.ProxyOption{adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName)}, options...)...)
 				if err != nil {
 					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
 				}
@@ -463,6 +503,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 			return nil, errors.New("file doesn't have any proxy")
 		}
 
+		accepted = true
 		return proxies, nil
 	}, nil
 }

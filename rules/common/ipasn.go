@@ -13,6 +13,7 @@ type ASN struct {
 	adapter     string
 	noResolveIP bool
 	isSourceIP  bool
+	scope       *geodata.Scope
 }
 
 func (a *ASN) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
@@ -28,7 +29,13 @@ func (a *ASN) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, strin
 		return false, ""
 	}
 
-	asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
+	var reader mmdb.ASNReader
+	if a.scope != nil {
+		reader = a.scope.ASNReader()
+	} else {
+		reader = mmdb.ASNInstance()
+	}
+	asn, aso := reader.LookupASN(ip.AsSlice())
 	if a.isSourceIP {
 		metadata.SrcIPASN = asn + " " + aso
 	} else {
@@ -73,3 +80,13 @@ func NewIPASN(asn string, adapter string, isSrc, noResolveIP bool) (*ASN, error)
 }
 
 var _ C.Rule = (*ASN)(nil)
+
+func NewScopedIPASN(asn, adapter string, isSrc, noResolveIP bool, scope *geodata.Scope) (*ASN, error) {
+	if scope == nil {
+		return NewIPASN(asn, adapter, isSrc, noResolveIP)
+	}
+	if err := scope.InitASN(); err != nil {
+		return nil, err
+	}
+	return &ASN{asn: asn, adapter: adapter, isSourceIP: isSrc, noResolveIP: noResolveIP, scope: scope}, nil
+}

@@ -21,6 +21,7 @@ type GEOIP struct {
 	adapter     string
 	noResolveIP bool
 	isSourceIP  bool
+	scope       *geodata.Scope
 }
 
 var _ C.Rule = (*GEOIP)(nil)
@@ -49,7 +50,7 @@ func (g *GEOIP) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, str
 		return g.isLan(ip), g.adapter
 	}
 
-	if geodata.GeodataMode() {
+	if g.geodataMode() {
 		if g.isSourceIP {
 			if slices.Contains(metadata.SrcGeoIP, g.country) {
 				return true, g.adapter
@@ -83,7 +84,7 @@ func (g *GEOIP) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, str
 			return slices.Contains(metadata.DstGeoIP, g.country), g.adapter
 		}
 	}
-	codes := mmdb.IPInstance().LookupCode(ip.AsSlice())
+	codes := g.ipReader().LookupCode(ip.AsSlice())
 	if g.isSourceIP {
 		metadata.SrcGeoIP = codes
 	} else {
@@ -105,7 +106,7 @@ func (g *GEOIP) MatchIp(ip netip.Addr) bool {
 		return g.isLan(ip)
 	}
 
-	if geodata.GeodataMode() {
+	if g.geodataMode() {
 		matcher, err := g.getIPMatcher()
 		if err != nil {
 			return false
@@ -113,7 +114,7 @@ func (g *GEOIP) MatchIp(ip netip.Addr) bool {
 		return matcher.Match(ip)
 	}
 
-	codes := mmdb.IPInstance().LookupCode(ip.AsSlice())
+	codes := g.ipReader().LookupCode(ip.AsSlice())
 	return slices.Contains(codes, g.country)
 }
 
@@ -131,7 +132,7 @@ func (g dnsFallbackFilter) MatchIp(ip netip.Addr) bool {
 		return !g.isLan(ip)
 	}
 
-	if geodata.GeodataMode() {
+	if g.geodataMode() {
 		matcher, err := g.getIPMatcher()
 		if err != nil {
 			return false
@@ -139,7 +140,7 @@ func (g dnsFallbackFilter) MatchIp(ip netip.Addr) bool {
 		return !matcher.Match(ip)
 	}
 
-	codes := mmdb.IPInstance().LookupCode(ip.AsSlice())
+	codes := g.ipReader().LookupCode(ip.AsSlice())
 	return !slices.Contains(codes, g.country)
 }
 
@@ -172,19 +173,55 @@ func (g *GEOIP) GetCountry() string {
 }
 
 func (g *GEOIP) GetIPMatcher() (router.IPMatcher, error) {
-	if geodata.GeodataMode() {
+	if g.geodataMode() {
 		return g.getIPMatcher()
 	}
 	return nil, errors.New("not geodata mode")
 }
 
 func (g *GEOIP) getIPMatcher() (router.IPMatcher, error) {
+	if g.scope != nil {
+		return g.scope.LoadGeoIPMatcher(g.country)
+	}
 	geoIPMatcher, err := geodata.LoadGeoIPMatcher(g.country)
 	if err != nil {
 		return nil, fmt.Errorf("[GeoIP] %w", err)
 	}
 	return geoIPMatcher, nil
 
+}
+
+func (g *GEOIP) geodataMode() bool {
+	if g.scope != nil {
+		return g.scope.GeodataMode()
+	}
+	return geodata.GeodataMode()
+}
+
+func (g *GEOIP) ipReader() mmdb.IPReader {
+	if g.scope != nil {
+		return g.scope.IPReader()
+	}
+	return mmdb.IPInstance()
+}
+
+func NewScopedGEOIP(country, adapter string, isSrc, noResolveIP bool, scope *geodata.Scope) (*GEOIP, error) {
+	if scope == nil {
+		return NewGEOIP(country, adapter, isSrc, noResolveIP)
+	}
+	rule := &GEOIP{country: strings.ToLower(country), adapter: adapter, isSourceIP: isSrc, noResolveIP: noResolveIP, scope: scope}
+	if rule.country == "lan" {
+		return rule, nil
+	}
+	if err := scope.InitGeoIP(); err != nil {
+		return nil, err
+	}
+	if scope.GeodataMode() {
+		if _, err := rule.getIPMatcher(); err != nil {
+			return nil, err
+		}
+	}
+	return rule, nil
 }
 
 func (g *GEOIP) GetRecodeSize() int {

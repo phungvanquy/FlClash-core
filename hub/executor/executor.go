@@ -87,6 +87,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	log.SetLevel(cfg.General.LogLevel)
 
 	tunnel.OnSuspend()
+	geodata.SetActiveScope(cfg.GeodataScope)
 
 	ca.ResetCertificate()
 	for _, c := range cfg.TLS.CustomTrustCert {
@@ -104,10 +105,6 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateGeneral(cfg.General, true)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
-	//updateListeners(cfg.General, cfg.Listeners, force)
-	//updateTun(cfg.General) // tun should not care "force"
-	updateIPTables(cfg)
-	updateTunnels(cfg.Tunnels)
 
 	tunnel.OnInnerLoading()
 
@@ -469,7 +466,7 @@ func patchSelectGroup(proxies map[string]C.Proxy) {
 	}
 }
 
-func updateIPTables(cfg *config.Config) {
+func ApplyIPTables(cfg *config.Config) (err error) {
 	tproxy.CleanupTProxyIPTables()
 
 	iptables := cfg.IPTables
@@ -477,11 +474,9 @@ func updateIPTables(cfg *config.Config) {
 		return
 	}
 
-	var err error
 	defer func() {
 		if err != nil {
 			log.Errorln("[IPTABLES] setting iptables failed: %s", err.Error())
-			os.Exit(2)
 		}
 	}()
 
@@ -530,6 +525,7 @@ func updateIPTables(cfg *config.Config) {
 	}
 
 	log.Infoln("[IPTABLES] Setting iptables completed")
+	return
 }
 
 func Shutdown() {

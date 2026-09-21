@@ -20,6 +20,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		DialerForAPI: opt.DialerForAPI,
 		TunnelForAPI: opt.TunnelForAPI,
 		ProviderName: opt.ProviderName,
+		OnActivate:   opt.OnActivate,
 	}
 
 	var (
@@ -223,6 +224,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	if err != nil {
 		return nil, err
 	}
+	constructed := proxy
+	accepted := false
+	defer func() {
+		if !accepted {
+			_ = constructed.Close()
+		}
+	}()
 
 	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist {
 		muxOption := &outbound.SingMuxOption{}
@@ -239,6 +247,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	}
 
 	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
+	accepted = true
 	return NewProxy(proxy), nil
 }
 
@@ -246,6 +255,8 @@ type proxyOption struct {
 	DialerForAPI C.Dialer
 	TunnelForAPI C.Tunnel
 	ProviderName string
+	Detached     bool
+	OnActivate   func(func())
 }
 
 func applyProxyOptions(options ...ProxyOption) proxyOption {
@@ -257,6 +268,16 @@ func applyProxyOptions(options ...ProxyOption) proxyOption {
 }
 
 type ProxyOption func(opt *proxyOption)
+
+func WithDetached(detached bool) ProxyOption {
+	return func(opt *proxyOption) { opt.Detached = detached }
+}
+
+func IsDetached(options ...ProxyOption) bool { return applyProxyOptions(options...).Detached }
+
+func WithDeferredActivation(activate func(func())) ProxyOption {
+	return func(opt *proxyOption) { opt.OnActivate = activate }
+}
 
 func WithDialerForAPI(dialer C.Dialer) ProxyOption {
 	return func(opt *proxyOption) {

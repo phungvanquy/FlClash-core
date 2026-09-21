@@ -16,6 +16,7 @@ type GEOSITE struct {
 	country    string
 	adapter    string
 	recodeSize int
+	scope      *geodata.Scope
 }
 
 func (gs *GEOSITE) RuleType() C.RuleType {
@@ -47,11 +48,25 @@ func (gs *GEOSITE) Payload() string {
 }
 
 func (gs *GEOSITE) GetDomainMatcher() (router.DomainMatcher, error) {
+	if gs.scope != nil {
+		return gs.scope.LoadGeoSiteMatcher(gs.country)
+	}
 	matcher, err := geodata.LoadGeoSiteMatcher(gs.country)
 	if err != nil {
 		return nil, fmt.Errorf("load GeoSite data error, %w", err)
 	}
 	return matcher, nil
+}
+
+func NewScopedGEOSITE(country, adapter string, scope *geodata.Scope) (*GEOSITE, error) {
+	if scope == nil {
+		return NewGEOSITE(country, adapter)
+	}
+	rule := &GEOSITE{country: country, adapter: adapter, scope: scope}
+	if _, err := rule.GetDomainMatcher(); err != nil {
+		return nil, err
+	}
+	return rule, nil
 }
 
 func (gs *GEOSITE) GetRecodeSize() int {

@@ -2,6 +2,7 @@ package rules
 
 import (
 	"fmt"
+	"github.com/metacubex/mihomo/component/geodata"
 
 	C "github.com/metacubex/mihomo/constant"
 	RC "github.com/metacubex/mihomo/rules/common"
@@ -10,6 +11,12 @@ import (
 )
 
 func ParseRule(tp, payload, target string, params []string, subRules map[string][]C.Rule) (parsed C.Rule, parseErr error) {
+	return (&Parser{}).ParseRule(tp, payload, target, params, subRules)
+}
+
+type Parser struct{ Geodata *geodata.Scope }
+
+func (p *Parser) ParseRule(tp, payload, target string, params []string, subRules map[string][]C.Rule) (parsed C.Rule, parseErr error) {
 	if tp != "MATCH" && payload == "" { // only MATCH allowed doesn't contain payload
 		return nil, fmt.Errorf("missing subsequent parameters: %s", tp)
 	}
@@ -26,17 +33,17 @@ func ParseRule(tp, payload, target string, params []string, subRules map[string]
 	case "DOMAIN-WILDCARD":
 		parsed, parseErr = RC.NewDomainWildcard(payload, target)
 	case "GEOSITE":
-		parsed, parseErr = RC.NewGEOSITE(payload, target)
+		parsed, parseErr = RC.NewScopedGEOSITE(payload, target, p.Geodata)
 	case "GEOIP":
 		isSrc, noResolve := RC.ParseParams(params)
-		parsed, parseErr = RC.NewGEOIP(payload, target, isSrc, noResolve)
+		parsed, parseErr = RC.NewScopedGEOIP(payload, target, isSrc, noResolve, p.Geodata)
 	case "SRC-GEOIP":
-		parsed, parseErr = RC.NewGEOIP(payload, target, true, true)
+		parsed, parseErr = RC.NewScopedGEOIP(payload, target, true, true, p.Geodata)
 	case "IP-ASN":
 		isSrc, noResolve := RC.ParseParams(params)
-		parsed, parseErr = RC.NewIPASN(payload, target, isSrc, noResolve)
+		parsed, parseErr = RC.NewScopedIPASN(payload, target, isSrc, noResolve, p.Geodata)
 	case "SRC-IP-ASN":
-		parsed, parseErr = RC.NewIPASN(payload, target, true, true)
+		parsed, parseErr = RC.NewScopedIPASN(payload, target, true, true, p.Geodata)
 	case "IP-CIDR", "IP-CIDR6":
 		isSrc, noResolve := RC.ParseParams(params)
 		parsed, parseErr = RC.NewIPCIDR(payload, target, RC.WithIPCIDRSourceIP(isSrc), RC.WithIPCIDRNoResolve(noResolve))
@@ -80,13 +87,13 @@ func ParseRule(tp, payload, target string, params []string, subRules map[string]
 	case "REMATCH-NAME":
 		parsed, parseErr = RC.NewRematchName(payload, target)
 	case "SUB-RULE":
-		parsed, parseErr = logic.NewSubRule(payload, target, subRules, ParseRule)
+		parsed, parseErr = logic.NewSubRule(payload, target, subRules, p.ParseRule)
 	case "AND":
-		parsed, parseErr = logic.NewAND(payload, target, ParseRule)
+		parsed, parseErr = logic.NewAND(payload, target, p.ParseRule)
 	case "OR":
-		parsed, parseErr = logic.NewOR(payload, target, ParseRule)
+		parsed, parseErr = logic.NewOR(payload, target, p.ParseRule)
 	case "NOT":
-		parsed, parseErr = logic.NewNOT(payload, target, ParseRule)
+		parsed, parseErr = logic.NewNOT(payload, target, p.ParseRule)
 	case "RULE-SET":
 		isSrc, noResolve := RC.ParseParams(params)
 		parsed, parseErr = RP.NewRuleSet(payload, target, isSrc, noResolve)

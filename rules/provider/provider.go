@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/pool"
@@ -87,7 +89,8 @@ func (bp *baseProvider) Strategy() any {
 type ruleSetProvider struct {
 	baseProvider
 	*resource.Fetcher[ruleStrategy]
-	format P.RuleFormat
+	format   P.RuleFormat
+	detached atomic.Bool
 }
 
 type RuleSetProvider struct {
@@ -95,7 +98,14 @@ type RuleSetProvider struct {
 }
 
 func (rp *ruleSetProvider) Initial() error {
+	rp.detached.Store(false)
 	_, err := rp.Fetcher.Initial()
+	return err
+}
+
+func (rp *ruleSetProvider) Prepare() error {
+	rp.detached.Store(true)
+	_, err := rp.Fetcher.Prepare()
 	return err
 }
 
@@ -132,7 +142,9 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
 
 	onUpdate := func(strategy ruleStrategy) {
 		rp.strategy = strategy
-		tunnel.RuleUpdateCallback().Emit(rp)
+		if !rp.detached.Load() {
+			tunnel.RuleUpdateCallback().Emit(rp)
+		}
 	}
 
 	rp.strategy = newStrategy(behavior, parse)
@@ -140,6 +152,9 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
 		rp.strategy = rulesParseInline(payload, rp.strategy)
 	}
 	rp.Fetcher = resource.NewFetcher(name, interval, vehicle, bundleFile, func(bytes []byte) (ruleStrategy, error) {
+		if rp.detached.Load() {
+			return rulesParseStrict(bytes, newStrategy(behavior, parse), format)
+		}
 		return rulesParse(bytes, newStrategy(behavior, parse), format)
 	}, onUpdate)
 
@@ -149,6 +164,61 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
 
 	runtime.SetFinalizer(wrapper, (*RuleSetProvider).Close)
 	return wrapper
+}
+
+func rulesParseStrictInline(payload []string, strategy ruleStrategy) (ruleStrategy, error) {
+	strategy.Reset()
+	for _, rule := range payload {
+		if rule == "" {
+			continue
+		}
+		if classical, ok := strategy.(*classicalStrategy); ok {
+			parsed, err := classical.payloadToRule(rule)
+			if err != nil {
+				return nil, fmt.Errorf("invalid provider rule: %w", err)
+			}
+			classical.rules = append(classical.rules, parsed)
+			classical.count++
+			continue
+		}
+		count := strategy.Count()
+		strategy.Insert(rule)
+		if strategy.Count() != count+1 {
+			return nil, fmt.Errorf("invalid provider rule: %s", rule)
+		}
+	}
+	strategy.FinishInsert()
+	return strategy, nil
+}
+
+func rulesParseStrict(buf []byte, strategy ruleStrategy, format P.RuleFormat) (ruleStrategy, error) {
+	var payload []string
+	switch format {
+	case P.MrsRule:
+		return rulesParse(buf, strategy, format)
+	case P.YamlRule:
+		schema := &RulePayload{}
+		if err := yaml.Unmarshal(buf, schema); err != nil {
+			return nil, err
+		}
+		payload = schema.Payload
+		if schema.Rules != nil {
+			payload = schema.Rules
+		}
+		if payload == nil {
+			return nil, ErrNoPayload
+		}
+	case P.TextRule:
+		for _, line := range strings.Split(string(buf), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "//") {
+				payload = append(payload, line)
+			}
+		}
+	default:
+		return nil, ErrInvalidFormat
+	}
+	return rulesParseStrictInline(payload, strategy)
 }
 
 func newStrategy(behavior P.RuleBehavior, parse common.ParseRuleFunc) ruleStrategy {
@@ -293,6 +363,10 @@ func (i *inlineProvider) Name() string {
 }
 
 func (i *inlineProvider) Initial() error {
+	return nil
+}
+
+func (i *inlineProvider) Prepare() error {
 	return nil
 }
 

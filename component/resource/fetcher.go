@@ -2,10 +2,12 @@ package resource
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/utils"
@@ -19,6 +21,8 @@ import (
 
 type Parser[V any] func([]byte) (V, error)
 type BundleFile func() (fs.File, error)
+
+var ErrManagedRefresh = errors.New("provider content refresh requires a new application-managed generation")
 
 type Fetcher[V any] struct {
 	ctx          context.Context
@@ -35,6 +39,11 @@ type Fetcher[V any] struct {
 	watcher      *fswatch.Watcher
 	loadBufMutex sync.Mutex
 	backoff      slowdown.Backoff
+	lifecycleMu  sync.Mutex
+	prepared     *V
+	started      bool
+	closed       bool
+	managed      atomic.Bool
 }
 
 func (f *Fetcher[V]) Name() string {
@@ -54,6 +63,21 @@ func (f *Fetcher[V]) UpdatedAt() time.Time {
 }
 
 func (f *Fetcher[V]) Initial() (V, error) {
+	f.lifecycleMu.Lock()
+	defer f.lifecycleMu.Unlock()
+	if f.closed {
+		return lo.Empty[V](), errors.New("provider is closed")
+	}
+	if f.prepared != nil {
+		if !f.started {
+			if err := f.startPullLoop(false); err != nil {
+				return lo.Empty[V](), err
+			}
+			f.started = true
+		}
+		return *f.prepared, nil
+	}
+	f.started = true
 	if stat, fErr := os.Stat(f.vehicle.Path()); fErr == nil {
 		// local file exists, use it first
 		buf, err := os.ReadFile(f.vehicle.Path())
@@ -113,7 +137,33 @@ func (f *Fetcher[V]) Initial() (V, error) {
 	return contents, nil
 }
 
+// Prepared content stays immutable; the host coordinates refresh generations.
+func (f *Fetcher[V]) Prepare() (V, error) {
+	f.lifecycleMu.Lock()
+	defer f.lifecycleMu.Unlock()
+	if f.closed || f.started {
+		return lo.Empty[V](), errors.New("provider is not available for preparation")
+	}
+	if f.prepared != nil {
+		return *f.prepared, nil
+	}
+	f.managed.Store(true)
+	buf, err := os.ReadFile(f.vehicle.Path())
+	if err != nil {
+		return lo.Empty[V](), err
+	}
+	contents, _, err := f.loadBuf(buf, utils.MakeHash(buf), false)
+	if err != nil {
+		return lo.Empty[V](), err
+	}
+	f.prepared = &contents
+	return contents, nil
+}
+
 func (f *Fetcher[V]) Update() (V, bool, error) {
+	if f.managed.Load() {
+		return lo.Empty[V](), false, ErrManagedRefresh
+	}
 	buf, hash, err := f.vehicle.Read(f.ctx, f.hash)
 	if err != nil {
 		f.backoff.AddAttempt() // add a failed attempt to backoff
@@ -123,6 +173,9 @@ func (f *Fetcher[V]) Update() (V, bool, error) {
 }
 
 func (f *Fetcher[V]) SideUpdate(buf []byte) (V, bool, error) {
+	if f.managed.Load() {
+		return lo.Empty[V](), false, ErrManagedRefresh
+	}
 	return f.loadBuf(buf, utils.MakeHash(buf), true)
 }
 
@@ -167,6 +220,10 @@ func (f *Fetcher[V]) loadBuf(buf []byte, hash utils.HashType, updateFile bool) (
 }
 
 func (f *Fetcher[V]) Close() error {
+	f.lifecycleMu.Lock()
+	defer f.lifecycleMu.Unlock()
+	f.closed = true
+	f.prepared = nil
 	f.ctxCancel()
 	if f.watcher != nil {
 		_ = f.watcher.Close()
@@ -210,6 +267,9 @@ func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
 }
 
 func (f *Fetcher[V]) startPullLoop(forceUpdate bool) (err error) {
+	if f.managed.Load() {
+		return nil
+	}
 	// pull contents automatically
 	if f.vehicle.Type() == P.File {
 		f.watcher, err = fswatch.NewWatcher(fswatch.Options{
