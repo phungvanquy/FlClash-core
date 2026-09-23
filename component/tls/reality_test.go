@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha512"
@@ -14,7 +15,7 @@ import (
 )
 
 func TestRealityFingerprintKeyShares(t *testing.T) {
-	for _, name := range []string{"", "chrome", "firefox", "safari", "chrome120", "firefox120", "safari16", "ios"} {
+	for _, name := range []string{"", "chrome", "firefox", "safari", "chrome120", "firefox120", "safari16", "ios", "android", "edge", "360", "qq"} {
 		t.Run(name, func(t *testing.T) {
 			id, err := GetRealityFingerprint(name, true)
 			if err != nil {
@@ -23,13 +24,19 @@ func TestRealityFingerprintKeyShares(t *testing.T) {
 			a, b := net.Pipe()
 			defer a.Close()
 			defer b.Close()
-			conn := utls.UClient(a, &utls.Config{ServerName: "example.test"}, id)
-			if err := conn.BuildHandshakeState(); err != nil {
+			conn, err := newRealityClient(a, &utls.Config{ServerName: "example.test"}, id, true)
+			if err != nil {
 				t.Fatal(err)
 			}
-			modern := name == "" || name == "chrome" || name == "firefox" || name == "safari"
+			modern := name != "chrome120" && name != "firefox120" && name != "safari16"
 			if err := validateRealityKeyShares(conn.HandshakeState.Hello.KeyShares); (err == nil) != modern {
 				t.Fatalf("modern=%t: %v", modern, err)
+			}
+			if name == "ios" || name == "android" || name == "edge" || name == "360" || name == "qq" || name == "firefox" {
+				keys := conn.HandshakeState.State13.KeyShareKeys
+				if keys.Ecdhe != nil && !bytes.Equal(keys.Ecdhe.PublicKey().Bytes(), keys.MlkemEcdhe.PublicKey().Bytes()) {
+					t.Fatal("hybrid and classical shares use different authentication keys")
+				}
 			}
 			if err := BuildRemovedX25519MLKEM768HandshakeState(conn); err != nil {
 				t.Fatal(err)
@@ -46,7 +53,11 @@ func TestRealityFingerprintKeyShares(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if id != fingerprints["chrome"] && id != fingerprints["firefox"] && id != fingerprints["safari"] {
+		eligible := false
+		for _, name := range realityFingerprints {
+			eligible = eligible || id == fingerprints[name]
+		}
+		if !eligible {
 			t.Fatalf("ineligible random fingerprint %v", id)
 		}
 	}
@@ -73,6 +84,33 @@ func TestRealityKeyShareValidation(t *testing.T) {
 		if err := validateRealityKeyShares(shares); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestRealityAdaptationDoesNotChangeOrdinaryTLS(t *testing.T) {
+	for _, name := range []string{"ios", "android", "edge", "360", "qq"} {
+		t.Run(name, func(t *testing.T) {
+			id, _ := GetRealityFingerprint(name, true)
+			conn, peer := net.Pipe()
+			defer conn.Close()
+			defer peer.Close()
+			if _, err := newRealityClient(conn, &utls.Config{ServerName: "example.test"}, id, true); err != nil {
+				t.Fatal(err)
+			}
+			generic, _ := GetFingerprint(name)
+			if generic != id {
+				t.Fatal("ordinary TLS fingerprint mapping changed")
+			}
+			ordinary := utls.UClient(conn, &utls.Config{ServerName: "example.test"}, generic)
+			if err := ordinary.BuildHandshakeState(); err != nil {
+				t.Fatal(err)
+			}
+			for _, share := range ordinary.HandshakeState.Hello.KeyShares {
+				if share.Group == utls.X25519MLKEM768 {
+					t.Fatal("REALITY adaptation modified the ordinary TLS preset")
+				}
+			}
+		})
 	}
 }
 

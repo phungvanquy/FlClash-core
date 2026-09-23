@@ -32,6 +32,8 @@ const RealityMaxShortIDLen = 8
 
 var realityCompatibilityVersion = [3]byte{26, 3, 27}
 
+var realityFingerprints = [...]string{"chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq"}
+
 type RealityConfig struct {
 	PublicKey *ecdh.PublicKey
 	ShortID   [RealityMaxShortIDLen]byte
@@ -45,8 +47,7 @@ func GetRealityFingerprint(name string, modern bool) (UClientHelloID, error) {
 		name = "chrome"
 	}
 	if modern && name == "random" {
-		choices := [...]string{"chrome", "firefox", "safari"}
-		name = choices[randv2.IntN(len(choices))]
+		name = realityFingerprints[randv2.IntN(len(realityFingerprints))]
 	}
 	fingerprint, ok := GetFingerprint(name)
 	if !ok {
@@ -88,12 +89,11 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			VerifyConnection:       verifier.VerifyConnection,
 		}
 
-		uConn := utls.UClient(conn, uConfig, fingerprint)
-		verifier.UConn = uConn
-		err := uConn.BuildHandshakeState()
+		uConn, err := newRealityClient(conn, uConfig, fingerprint, realityConfig.SupportX25519MLKEM768)
 		if err != nil {
 			return nil, err
 		}
+		verifier.UConn = uConn
 
 		if !realityConfig.SupportX25519MLKEM768 { // for X25519MLKEM768 does not work properly with the old reality server
 			err = BuildRemovedX25519MLKEM768HandshakeState(uConn)
