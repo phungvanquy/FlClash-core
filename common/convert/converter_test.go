@@ -217,6 +217,11 @@ func TestConvertsV2RayRealityMLKEM768(t *testing.T) {
 					"?security=reality&type=tcp&sid=00112233&pbk=" + tt.publicKey + tt.query
 				for _, input := range []string{uri, base64.StdEncoding.EncodeToString([]byte(uri))} {
 					proxies, err := ConvertsV2Ray([]byte(input))
+					if tt.name == "empty" || tt.name == "invalid" || tt.name == "no-public-key" {
+						assert.Error(t, err)
+						assert.Nil(t, proxies)
+						continue
+					}
 					if !assert.NoError(t, err) || !assert.Len(t, proxies, 1) {
 						return
 					}

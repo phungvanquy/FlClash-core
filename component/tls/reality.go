@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/metacubex/http"
 	"github.com/metacubex/randv2"
 	utls "github.com/metacubex/utls"
@@ -28,17 +30,55 @@ import (
 
 const RealityMaxShortIDLen = 8
 
+var realityCompatibilityVersion = [3]byte{26, 3, 27}
+
 type RealityConfig struct {
 	PublicKey *ecdh.PublicKey
 	ShortID   [RealityMaxShortIDLen]byte
 
 	SupportX25519MLKEM768 bool
+	Mldsa65Verify         *mldsa65.PublicKey
+}
+
+func GetRealityFingerprint(name string, modern bool) (UClientHelloID, error) {
+	if name == "" {
+		name = "chrome"
+	}
+	if modern && name == "random" {
+		choices := [...]string{"chrome", "firefox", "safari"}
+		name = choices[randv2.IntN(len(choices))]
+	}
+	fingerprint, ok := GetFingerprint(name)
+	if !ok {
+		return UClientHelloID{}, fmt.Errorf("unsupported REALITY client-fingerprint %q", name)
+	}
+	return fingerprint, nil
+}
+
+func validateRealityKeyShares(shares []utls.KeyShare) error {
+	hybrid, classical := 0, 0
+	for _, share := range shares {
+		switch share.Group {
+		case utls.X25519MLKEM768:
+			if classical != 0 || len(share.Data) != 1216 {
+				return errors.New("invalid REALITY hybrid key-share order or size")
+			}
+			hybrid++
+		case utls.X25519:
+			classical++
+		}
+	}
+	if hybrid != 1 || classical > 1 {
+		return errors.New("REALITY requires one X25519MLKEM768 key share before optional X25519")
+	}
+	return nil
 }
 
 func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHelloID, serverName string, realityConfig *RealityConfig) (net.Conn, error) {
 	for retry := 0; ; retry++ {
 		verifier := &realityVerifier{
-			serverName: serverName,
+			serverName:    serverName,
+			mldsa65Verify: realityConfig.Mldsa65Verify,
 		}
 		uConfig := &utls.Config{
 			Time:                   ntp.Now,
@@ -60,6 +100,8 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			if err != nil {
 				return nil, err
 			}
+		} else if err := validateRealityKeyShares(uConn.HandshakeState.Hello.KeyShares); err != nil {
+			return nil, fmt.Errorf("REALITY client-fingerprint %s-%s: %w; use chrome, firefox or safari, or explicit support-x25519mlkem768: false for a legacy server", fingerprint.Client, fingerprint.Version, err)
 		}
 
 		hello := uConn.HandshakeState.Hello
@@ -68,18 +110,13 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			rawSessionID[i] = 0
 		}
 
-		binary.BigEndian.PutUint64(hello.SessionId, uint64(ntp.Now().Unix()))
-
+		copy(hello.SessionId, realityCompatibilityVersion[:])
+		hello.SessionId[3] = 0
+		binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(ntp.Now().Unix()))
 		copy(hello.SessionId[8:], realityConfig.ShortID[:])
-		hello.SessionId[0] = 1
-		hello.SessionId[1] = 8
-		hello.SessionId[2] = 2
-
-		//log.Debugln("REALITY hello.sessionId[:16]: %v", hello.SessionId[:16])
 
 		keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
 		if keyShareKeys == nil {
-			// WTF???
 			if retry > 2 {
 				return nil, errors.New("nil keyShareKeys")
 			}
@@ -90,7 +127,6 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			ecdheKey = keyShareKeys.MlkemEcdhe
 		}
 		if ecdheKey == nil {
-			// WTF???
 			if retry > 2 {
 				return nil, errors.New("nil ecdheKey")
 			}
@@ -112,8 +148,6 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		aeadCipher, _ := cipher.NewGCM(aesBlock)
 		aeadCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
 		copy(hello.Raw[39:], hello.SessionId)
-		//log.Debugln("REALITY hello.sessionId: %v", hello.SessionId)
-		//log.Debugln("REALITY uConn.AuthKey: %v", authKey)
 
 		err = uConn.HandshakeContext(ctx)
 		if err != nil {
@@ -158,7 +192,6 @@ func realityClientFallback(uConn net.Conn, serverName string, fingerprint utls.C
 	if err != nil {
 		return
 	}
-	//_, _ = io.Copy(io.Discard, response.Body)
 	time.Sleep(time.Duration(5+randv2.IntN(10)) * time.Second)
 	response.Body.Close()
 	client.CloseIdleConnections()
@@ -166,18 +199,31 @@ func realityClientFallback(uConn net.Conn, serverName string, fingerprint utls.C
 
 type realityVerifier struct {
 	*utls.UConn
-	serverName string
-	authKey    []byte
-	verified   bool
+	serverName    string
+	authKey       []byte
+	verified      bool
+	mldsa65Verify *mldsa65.PublicKey
 }
 
 func (c *realityVerifier) VerifyConnection(state utls.ConnectionState) error {
-	log.Debugln("REALITY localAddr: %v is using X25519MLKEM768 for TLS' communication: %v", c.RemoteAddr(), c.HandshakeState.ServerHello.ServerShare.Group == utls.X25519MLKEM768)
 	certs := state.PeerCertificates
+	if len(certs) == 0 || certs[0] == nil {
+		return errors.New("REALITY server supplied no certificate")
+	}
 	if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
 		h := hmac.New(sha512.New, c.authKey)
 		h.Write(pub)
 		if bytes.Equal(h.Sum(nil), certs[0].Signature) {
+			if c.mldsa65Verify != nil {
+				if len(certs[0].Extensions) == 0 || c.UConn == nil || c.HandshakeState.Hello == nil || c.HandshakeState.ServerHello == nil {
+					return errors.New("REALITY ML-DSA-65 verification data is missing")
+				}
+				h.Write(c.HandshakeState.Hello.Raw)
+				h.Write(c.HandshakeState.ServerHello.Raw)
+				if !mldsa65.Verify(c.mldsa65Verify, h.Sum(nil), nil, certs[0].Extensions[0].Value) {
+					return errors.New("REALITY ML-DSA-65 verification failed")
+				}
+			}
 			c.verified = true
 			return nil
 		}

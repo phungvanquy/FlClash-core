@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -231,6 +232,9 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			vless := make(map[string]any, 20)
 			err = handleVShareLink(names, urlVLess, scheme, vless)
 			if err != nil {
+				if errors.Is(err, errSecurityOptions) {
+					return nil, err
+				}
 				log.Warnln("error:%s line:%s", err.Error(), line)
 				continue
 			}
@@ -256,6 +260,9 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				vmess := make(map[string]any, 20)
 				err = handleVShareLink(names, urlVMess, scheme, vmess)
 				if err != nil {
+					if errors.Is(err, errSecurityOptions) {
+						return nil, err
+					}
 					log.Warnln("error:%s line:%s", err.Error(), line)
 					continue
 				}

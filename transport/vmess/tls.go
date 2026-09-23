@@ -2,7 +2,6 @@ package vmess
 
 import (
 	"context"
-	"errors"
 	"net"
 
 	"github.com/metacubex/mihomo/component/ca"
@@ -111,10 +110,14 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 		return nil, err
 	}
 
-	if clientFingerprint, ok := tlsC.GetFingerprint(cfg.ClientFingerprint); ok {
-		if cfg.Reality != nil {
-			return tlsC.GetRealityConn(ctx, conn, clientFingerprint, tlsConfig.ServerName, cfg.Reality)
+	if cfg.Reality != nil {
+		fingerprint, err := tlsC.GetRealityFingerprint(cfg.ClientFingerprint, cfg.Reality.SupportX25519MLKEM768)
+		if err != nil {
+			return nil, err
 		}
+		return tlsC.GetRealityConn(ctx, conn, fingerprint, tlsConfig.ServerName, cfg.Reality)
+	}
+	if clientFingerprint, ok := tlsC.GetFingerprint(cfg.ClientFingerprint); ok {
 		tlsConfig := tlsC.UConfig(tlsConfig)
 		err = cfg.ECH.ClientHandleUTLS(ctx, tlsConfig)
 		if err != nil {
@@ -126,9 +129,6 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 			return nil, err
 		}
 		return tlsConn, nil
-	}
-	if cfg.Reality != nil {
-		return nil, errors.New("REALITY is based on uTLS, please set a client-fingerprint")
 	}
 
 	err = cfg.ECH.ClientHandle(ctx, tlsConfig)

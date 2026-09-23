@@ -9,6 +9,8 @@ import (
 	"strings"
 )
 
+var errSecurityOptions = errors.New("invalid proxy security options")
+
 func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy map[string]any) error {
 	// Xray VMessAEAD / VLESS share link standard
 	// https://github.com/XTLS/Xray-core/discussions/716
@@ -48,12 +50,19 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 			"public-key": realityPublicKey,
 			"short-id":   query.Get("sid"),
 		}
-		if value := query.Get("support-x25519mlkem768"); value != "" {
-			if enabled, err := strconv.ParseBool(value); err == nil {
-				realityOpts["support-x25519mlkem768"] = enabled
+		if value, present := query["support-x25519mlkem768"]; present {
+			enabled, err := strconv.ParseBool(value[0])
+			if err != nil || len(value) != 1 {
+				return fmt.Errorf("%w: support-x25519mlkem768 must be a boolean", errSecurityOptions)
 			}
+			realityOpts["support-x25519mlkem768"] = enabled
+		}
+		if verification := query.Get("pqv"); verification != "" {
+			realityOpts["mldsa65-verify"] = verification
 		}
 		proxy["reality-opts"] = realityOpts
+	} else if tls == "reality" || query.Get("sid") != "" || query.Get("pqv") != "" || query.Has("support-x25519mlkem768") {
+		return fmt.Errorf("%w: REALITY requires pbk", errSecurityOptions)
 	}
 
 	switch query.Get("packetEncoding") {
@@ -157,9 +166,13 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 
 		if extra := query.Get("extra"); extra != "" {
 			var extraMap map[string]any
-			if err := json.Unmarshal([]byte(extra), &extraMap); err == nil {
-				parseXHTTPExtra(extraMap, xhttpOpts)
+			if err := json.Unmarshal([]byte(extra), &extraMap); err != nil || extraMap == nil {
+				return fmt.Errorf("%w: XHTTP extra must be a JSON object", errSecurityOptions)
 			}
+			if err := validateXHTTPSecurity(extraMap); err != nil {
+				return err
+			}
+			parseXHTTPExtra(extraMap, xhttpOpts)
 		}
 
 		proxy["xhttp-opts"] = xhttpOpts
@@ -168,9 +181,53 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 	return nil
 }
 
-// parseXHTTPExtra maps xray-core extra JSON fields to mihomo xhttp-opts fields.
+func validateXHTTPSecurity(extra map[string]any) error {
+	download, present := extra["downloadSettings"]
+	if !present {
+		return nil
+	}
+	ds, ok := download.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%w: downloadSettings must be an object", errSecurityOptions)
+	}
+	security, present := ds["security"]
+	if present {
+		value, ok := security.(string)
+		if !ok || (value != "none" && value != "tls" && value != "reality" && value != "") {
+			return fmt.Errorf("%w: unsupported downloadSettings security", errSecurityOptions)
+		}
+	}
+	if security != "reality" {
+		if _, present := ds["realitySettings"]; present {
+			return fmt.Errorf("%w: realitySettings requires download security reality", errSecurityOptions)
+		}
+		return nil
+	}
+	reality, ok := ds["realitySettings"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%w: missing download realitySettings", errSecurityOptions)
+	}
+	for _, field := range []string{"password", "publicKey", "serverName", "fingerprint", "shortId", "mldsa65Verify"} {
+		if value, present := reality[field]; present {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("%w: download REALITY %s must be a string", errSecurityOptions, field)
+			}
+		}
+	}
+	if value, present := reality["support-x25519mlkem768"]; present {
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("%w: download REALITY support-x25519mlkem768 must be a boolean", errSecurityOptions)
+		}
+	}
+	if password, _ := reality["password"].(string); password == "" {
+		if publicKey, _ := reality["publicKey"].(string); publicKey == "" {
+			return fmt.Errorf("%w: download REALITY requires password or publicKey", errSecurityOptions)
+		}
+	}
+	return nil
+}
+
 func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
-	// xmuxToReuse converts an xmux map to mihomo reuse-settings.
 	xmuxToReuse := func(xmux map[string]any) map[string]any {
 		reuse := make(map[string]any)
 		set := func(src, dst string) {
@@ -196,6 +253,9 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 		return reuse
 	}
 
+	if headers, ok := extra["headers"].(map[string]any); ok && len(headers) > 0 {
+		opts["headers"] = headers
+	}
 	if v, ok := extra["noGRPCHeader"].(bool); ok && v {
 		opts["no-grpc-header"] = true
 	}
@@ -333,6 +393,21 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 					if pk, ok := realityAny["publicKey"].(string); ok && pk != "" {
 						realityOpts["public-key"] = pk
 					}
+					if password, ok := realityAny["password"].(string); ok && password != "" {
+						realityOpts["public-key"] = password
+					}
+					if sn, ok := realityAny["serverName"].(string); ok {
+						ds["servername"] = sn
+					}
+					if fp, ok := realityAny["fingerprint"].(string); ok {
+						ds["client-fingerprint"] = fp
+					}
+					if key, ok := realityAny["mldsa65Verify"].(string); ok && key != "" {
+						realityOpts["mldsa65-verify"] = key
+					}
+					if enabled, ok := realityAny["support-x25519mlkem768"].(bool); ok {
+						realityOpts["support-x25519mlkem768"] = enabled
+					}
 					if sid, ok := realityAny["shortId"].(string); ok && sid != "" {
 						realityOpts["short-id"] = sid
 					}
@@ -356,6 +431,9 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 
 			// xmux inside downloadSettings.xhttpSettings.extra → download-settings.reuse-settings
 			if dsExtraAny, ok := xhttpAny["extra"].(map[string]any); ok {
+				if headers, ok := dsExtraAny["headers"].(map[string]any); ok {
+					ds["headers"] = headers
+				}
 				if xmuxAny, ok := dsExtraAny["xmux"].(map[string]any); ok && len(xmuxAny) > 0 {
 					if reuse := xmuxToReuse(xmuxAny); len(reuse) > 0 {
 						ds["reuse-settings"] = reuse
